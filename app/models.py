@@ -322,6 +322,16 @@ class SensitiveColumnsReplaceRequest(StrictModel):
         return self
 
 
+class PackageReleaseRequest(StrictModel):
+    """Release a sealed export package under the current registry generation.
+
+    ``expected_generation`` must equal the current registry generation; a
+    stale value rejects the release as HTTP 409 without recording anything.
+    """
+
+    expected_generation: int = Field(ge=0)
+
+
 class PruneRequest(StrictModel):
     """A review request plus the export columns the caller wants to keep.
 

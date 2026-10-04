@@ -1,20 +1,26 @@
-"""SQLite-backed persistence for registered graphs and the shared registry.
+"""SQLite-backed persistence for graphs, the shared registry and packages.
 
-Two pieces of state survive restarts:
+Three pieces of state survive restarts:
 
 * the shared sensitive-column registry (entries keyed by ``(source, column)``)
   together with its monotonically increasing ``generation`` (0 on a fresh
   database, incremented once per successful whole-list replacement);
 * every registered graph: its original ``nodes``/``export`` submission and the
   review result produced under the registry generation the graph was last
-  reviewed at.
+  reviewed at;
+* every sealed export package: the graph it was sealed from, the sample
+  ``columns``/``rows`` frozen at seal time, the registry ``generation`` the
+  package was created under, and — once released — the ``release_generation``
+  the package was released under (NULL while unreleased).
 
 All reads and writes of the in-process state go through one lock, and a
 replacement persists the new entries, the new generation and every graph's new
 review result in a single explicit SQLite transaction: either the whole change
 commits or nothing at all changes, so a registry can never be observed
 together with stale conclusions — not even after a write or commit failure,
-and not after the database is reopened.
+and not after the database is reopened. Sealing a package and recording its
+release are likewise single atomic writes: a failed write or commit never
+leaves a new package or a new release record behind.
 """
 
 from __future__ import annotations
@@ -48,6 +54,15 @@ CREATE TABLE IF NOT EXISTS graphs (
     export TEXT NOT NULL,
     review TEXT NOT NULL,
     review_generation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packages (
+    id TEXT PRIMARY KEY,
+    ordinal INTEGER NOT NULL,
+    graph_id TEXT NOT NULL,
+    columns TEXT NOT NULL,
+    rows TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    release_generation INTEGER
 );
 """
 
@@ -206,6 +221,65 @@ class Store:
                     json.dumps(review, ensure_ascii=False),
                     generation,
                 ),
+            )
+
+    # ----------------------------------------------------------- packages --
+
+    def list_package_rows(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, graph_id, columns, rows, generation, "
+            "release_generation FROM packages ORDER BY ordinal"
+        ).fetchall()
+
+    def get_package_row(self, package_id: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, graph_id, columns, rows, generation, "
+            "release_generation FROM packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+
+    def insert_package(
+        self,
+        package_id: str,
+        graph_id: str,
+        columns: list[str],
+        rows: list[list[object]],
+        generation: int,
+    ) -> None:
+        """Persist a freshly sealed (still unreleased) package atomically.
+
+        A failed write or commit rolls the insert back: no half-written
+        package is ever left behind.
+        """
+        next_ordinal = self._conn.execute(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM packages"
+        ).fetchone()[0]
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO packages "
+                "(id, ordinal, graph_id, columns, rows, generation, "
+                " release_generation) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    package_id,
+                    next_ordinal,
+                    graph_id,
+                    json.dumps(columns, ensure_ascii=False),
+                    json.dumps(rows, ensure_ascii=False),
+                    generation,
+                ),
+            )
+
+    def release_package(self, package_id: str, release_generation: int) -> None:
+        """Record the release generation atomically.
+
+        Re-releasing after a registry change overwrites the previous release
+        generation. A failed write or commit leaves the old release state
+        (released or not) exactly as it was.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE packages SET release_generation = ? WHERE id = ?",
+                (release_generation, package_id),
             )
 
 

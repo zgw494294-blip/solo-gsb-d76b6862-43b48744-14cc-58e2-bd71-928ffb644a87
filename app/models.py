@@ -284,6 +284,18 @@ class GraphPreviewRequest(StrictModel):
     conditions: dict[str, dict[str, object]] = Field(default_factory=dict)
 
 
+class PackageReleaseRequest(StrictModel):
+    """Approval of a sealed export package, guarded by the registry generation.
+
+    ``expected_generation`` must equal the current registry generation. A
+    stale value rejects the release as HTTP 409 without writing anything;
+    even when it matches, the release still fails (HTTP 400) if the graph is
+    blocked under that current generation.
+    """
+
+    expected_generation: int = Field(ge=0)
+
+
 class SensitiveColumnEntryIn(StrictModel):
     """One shared sensitive-column entry, identified by source id and column.
 

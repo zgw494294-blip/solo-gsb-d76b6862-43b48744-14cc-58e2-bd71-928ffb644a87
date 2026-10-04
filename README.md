@@ -38,7 +38,10 @@
 **共用敏感列名录（sensitive-column registry）**：名录按**源 ID + 列名**标识，与每张图自身的
 `sensitive` 标记**取 OR**；登记图随后随名录变化被**自动重审**，预演则以登记图 ID 引用、
 只提交 `rows`/`conditions`，并以**当前审查结论**作为放行依据，详见下文“登记图与共用敏感列名录”。
-名录与登记图保存在 **SQLite**（Docker Compose 命名卷），重启后仍然可用。
+一次通过的登记图预演还可以**封存**为**待放行导出包**：经与名录代次绑定的**放行**后，
+领取方在放行仍对应当前代次时才能拿到这份**封存样本**（名录一变即拒领，须在新代次重新放行），
+详见下文“待放行导出包”。名录、登记图、包与放行记录保存在 **SQLite**（Docker Compose 命名卷），
+重启后仍然可用。
 
 ## 风险传播规则
 
@@ -1141,6 +1144,9 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 | `POST` | `/api/graphs` | 登记一张图（请求体与 `/api/review` 完全同构：`nodes` + `export`）。**沿用整图校验**（图无效即以 `/api/review` 的原错误码返回 400，不登记任何内容），按当前名录重审，返回 **201** 与图 `id`、原图、当前 `generation` 与 `review` |
 | `GET` | `/api/graphs/{id}` | 读取登记图：返回**原始 `nodes`/`export`**、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
+| `POST` | `/api/graphs/{id}/packages` | **封存**待放行导出包：请求体与按 ID 预演相同（只含 `rows`、`conditions`），沿用当前名录与全部原预演规则；仅当预演成功（当前审查不阻断）才在同一事务里把 `columns`、`rows` 与**创建代次**存入 SQLite，返回 **201**，响应**只有包 `id` 与 `generation`**（不含样本）。输入错误（原预演 400 错误码）或当前图阻断（`PREVIEW_BLOCKED`）时**不建包**；未知图 ID 返回 **404** `GRAPH_NOT_FOUND`，schema 问题返回 **422** |
+| `POST` | `/api/packages/{id}/release` | **放行**封存包：`{"expected_generation": N}`。期望代次不等于当前代次返回 **409** `PACKAGE_GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不写任何放行记录；代次相符但图在当前名录下**阻断**时返回 **400** `PACKAGE_GRAPH_BLOCKED`（带 `review`），**不放行**（此前的旧放行记录保留）；成功时在同一事务保存**放行代次**，响应**只有包 `id` 与该代次**。同一代次重复放行幂等；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
+| `GET` | `/api/packages/{id}` | **领取**放行包：返回**封存的** `columns`、`rows`（**不重算**）、`graph_id`、`created_generation` 与 `released_generation`。未放行返回 **409** `PACKAGE_NOT_RELEASED`；放行代次不等于当前代次（封存放行后名录又替换过，哪怕名录恢复安全）返回 **409** `PACKAGE_GENERATION_CONFLICT`，且响应**不含任何样本**；需在新代次**重新放行**后才能领取。未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
 | `GET` | `/api/sensitive-columns` | 读取当前名录：`{"generation": N, "entries": [...]}`（条目按提交顺序） |
 | `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）；写库异常返回 **500** `INTERNAL`，名录、代次与结论全部保持旧值 |
 
@@ -1326,6 +1332,167 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 > `sensitive` 标记——图内全部为 `false` 时，即使名录已标 `users.email`，旧接口仍判安全、
 > 照常返回样本。名录只作用于登记图与按图 ID 的预演。
 
+## 待放行导出包：封存 → 放行 → 领取
+
+按图 ID 的预演是“即算即返”；待放行导出包则把一次**成功预演的小样本结果封存**进 SQLite，
+随后经过一次与名录代次绑定的**放行**，领取方才能在放行仍然有效时拿到这份**封存结果**。
+包与放行记录随现有 Compose 命名卷持久化，重启后仍在。
+
+* **封存（seal）**：`POST /api/graphs/{图ID}/packages`，请求体与按 ID 预演完全相同——
+  只含 `rows`、`conditions`，**沿用当前名录和原预演规则**（覆盖、键集合、标量、200 行上限
+  等一律不变）。仅当预演成功（当前审查结论不阻断）时，才在**同一事务**里把结果的
+  `columns`、`rows` 与**创建代次**存入 SQLite；响应 **201** 且**只返回包 `id` 与创建代次**，
+  样本不外泄。输入错误（原预演各 400 错误码）或当前图阻断（`PREVIEW_BLOCKED`，400）时
+  **不建包**；写库/提交失败（500）同样不留新包。
+* **放行（release）**：`POST /api/packages/{包ID}/release`，提交
+  `{"expected_generation": N}`。`expected_generation` 与当前代次不符（过期）返回 **409**
+  `PACKAGE_GENERATION_CONFLICT`，什么都不写；代次相符但图在**当前名录下阻断**时返回 **400**
+  `PACKAGE_GRAPH_BLOCKED`（错误体带当前 `review`，**不含样本**），**不放行**——若该包此前在
+  旧代次放行成功，旧放行记录保持不变（但名录已变，它对领取而言已经过期）。成功时在同一事务
+  保存**放行代次**，响应**只返回包 `id` 与该代次**；同一代次重复放行是幂等的。写库/提交失败
+  不留新放行记录。
+* **领取（claim）**：`GET /api/packages/{包ID}`。返回**封存时**的 `columns`、`rows`（**绝不
+  重算**，领取方也不能换用另一批 `rows`/`conditions`——封存的是哪批就是哪批）、`graph_id`、
+  `created_generation` 与 `released_generation`。**从未放行**返回 **409**
+  `PACKAGE_NOT_RELEASED`；**放行代次不等于当前代次**（放行之后名录又成功替换过一次，哪怕
+  替换后的名录重新安全）返回 **409** `PACKAGE_GENERATION_CONFLICT`，响应**不含任何样本**——
+  名录恢复安全也必须在**新代次重新放行**才能领取。未知图或包一律 **404**
+  （`GRAPH_NOT_FOUND` / `PACKAGE_NOT_FOUND`）。
+
+### 并发次序与失败原子性
+
+封存、放行、领取与名录替换共用同一把进程级锁，按**某个先后次序整体生效**，与登记图预演的
+保证一致：每一步看到的名录、代次、图结论都来自同一快照，绝不会按旧代次放行或领取。封存的
+写入与放行的写入分别包在单个显式 SQLite 事务里，写入中途或 COMMIT 失败整体回滚——失败后
+既看不到新包，也看不到新放行记录（重开数据库亦然），故障解除后用同一请求重试即可。
+
+### curl 走一遍：封存 → 放行 → 名录变更后拒领 → 再放行领取
+
+沿用前面登记的 `$GID`（图内无源列标敏感；名录初始为空、代次 0）。
+
+```bash
+# 1) 封存：请求体与按 ID 预演相同；成功只回包 id 与创建代次（无样本）
+PID=$(curl -s -X POST http://localhost:8080/api/graphs/$GID/packages \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "rows": {"users": [
+    {"uid": 1, "email": "a@x.example", "country": "CN"},
+    {"uid": 2, "email": "b@x.example", "country": "US"}]},
+  "conditions": {"only_cn": {"country": "CN"}}
+}' | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+echo "sealed package: $PID"
+# 响应体：{"id":"...","generation":0}
+```
+
+```bash
+# 未放行先领取：409 PACKAGE_NOT_RELEASED，错误体里没有任何样本
+curl -s -i http://localhost:8080/api/packages/$PID
+# HTTP/1.1 409 ...
+# {"error":{"code":"PACKAGE_NOT_RELEASED",
+#   "message":"package '...' has not been released","current_generation":0}}
+```
+
+```bash
+# 2) 放行：提交当前代次 0；成功只回包 id 与放行代次
+curl -s -X POST http://localhost:8080/api/packages/$PID/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 0}'
+# {"id":"...","generation":0}
+```
+
+```bash
+# 3) 领取：返回封存结果（不重算）、图 ID、创建代次与放行代次
+curl -s http://localhost:8080/api/packages/$PID
+# {"id":"...","graph_id":"<图ID>",
+#  "columns":["user_id","mail","bucket"],
+#  "rows":[[1,"a@x.example","ALL"]],
+#  "created_generation":0,"released_generation":0}
+```
+
+```bash
+# 4) 名录变更（把 users.email 标为敏感）：代次推进到 1，图当前结论变为阻断
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [{"source": "users", "column": "email"}],
+       "expected_generation": 0}'
+# {"generation":1,...}
+```
+
+```bash
+# 5) 名录变更后领取旧包：409 PACKAGE_GENERATION_CONFLICT，不含样本；
+#    哪怕随后把名录清空（图恢复安全），放行代次 0 仍不等于当前代次，照样拒领
+curl -s -i http://localhost:8080/api/packages/$PID
+# HTTP/1.1 409 ...
+# {"error":{"code":"PACKAGE_GENERATION_CONFLICT",
+#   "expected_generation":0,"current_generation":1,...}}
+
+# 在阻断代次尝试放行：400 PACKAGE_GRAPH_BLOCKED，不放行（带当前 review，无样本）
+curl -s -i -X POST http://localhost:8080/api/packages/$PID/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 1}'
+# HTTP/1.1 400 ... {"error":{"code":"PACKAGE_GRAPH_BLOCKED",
+#   "node_id":"export_users","review":{"blocked":true,...}}}
+
+# 用过期代次放行：409
+curl -s -i -X POST http://localhost:8080/api/packages/$PID/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 0}'
+# HTTP/1.1 409 ... PACKAGE_GENERATION_CONFLICT, current_generation 1
+```
+
+```bash
+# 6) 名录恢复安全（清空，代次变为 2）后，仍须在新代次重新放行：
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [], "expected_generation": 1}'
+# {"generation":2,...}
+
+# 名录恢复安全但未重新放行：领取仍是 409（旧放行代次 0 != 当前代次 2）
+curl -s -i http://localhost:8080/api/packages/$PID
+# HTTP/1.1 409 ... PACKAGE_GENERATION_CONFLICT, current_generation 2
+
+# 在当前代次 2 重新放行（同代次重复放行幂等）：
+curl -s -X POST http://localhost:8080/api/packages/$PID/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 2}'
+# {"id":"...","generation":2}
+
+# 再领取：拿到的仍是当初封存的同一份样本（不重算、不换批次），
+# 创建代次保持 0，放行代次变为 2
+curl -s http://localhost:8080/api/packages/$PID
+# {"id":"...","graph_id":"<图ID>",
+#  "columns":["user_id","mail","bucket"],
+#  "rows":[[1,"a@x.example","ALL"]],
+#  "created_generation":0,"released_generation":2}
+```
+
+其他行为：
+
+```bash
+# 封存沿用全部原预演规则：覆盖缺失（PREVIEW_SOURCE_COVERAGE）、行键不符（PREVIEW_ROW_KEYS）、
+# 非标量（PREVIEW_NON_SCALAR）、超 200 行（PREVIEW_ROW_LIMIT）等均为 400，且不建包；
+# 请求体多带字段（如 nodes）或缺 rows 是 schema 错误：422，同样不建包
+curl -s -i -X POST http://localhost:8080/api/graphs/$GID/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"rows": {}, "conditions": {"only_cn": {"country": "CN"}}}'
+# HTTP/1.1 400 ... {"error":{"code":"PREVIEW_SOURCE_COVERAGE",...}}
+
+# 图当前阻断时封存：400 PREVIEW_BLOCKED，无样本、无新包
+curl -s -i -X POST http://localhost:8080/api/graphs/$GID/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"rows": {"users": [{"uid": 1, "email": "a@x.example", "country": "CN"}]},
+       "conditions": {"only_cn": {"country": "CN"}}}'
+# HTTP/1.1 400 ... {"error":{"code":"PREVIEW_BLOCKED",...}}（名录标敏后）
+
+# 未知图 / 未知包：404
+curl -s -i -X POST http://localhost:8080/api/graphs/does-not-exist/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"rows": {}, "conditions": {}}'
+# HTTP/1.1 404 ... {"error":{"code":"GRAPH_NOT_FOUND",...}}
+curl -s -i http://localhost:8080/api/packages/does-not-exist
+# HTTP/1.1 404 ... {"error":{"code":"PACKAGE_NOT_FOUND",...}}
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -1361,13 +1528,13 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest）
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest、PackageReleaseRequest）
 app/engine.py     图校验、拓扑排序、来源传播（图内标记 ∪ 名录的 OR 敏感集）、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演与两版导出风险对照
-app/registry.py   登记图/按图预演/名录读取与整份替换：锁内取快照、重审全部登记图、世代冲突
-app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论；替换与结论在同一显式事务提交，写入/提交失败整体回滚）
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/sensitive-columns、/health）
+app/registry.py   登记图/按图预演/名录读取与整份替换，以及待放行导出包的封存、放行与领取：锁内取快照，封存只存成功预演，放行绑定名录代次，领取只返回封存结果，世代冲突
+app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论、封存包样本与创建/放行代次；替换、结论、封存与放行均在显式事务提交，写入/提交失败整体回滚）
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/sensitive-columns、/health）
 examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，以及登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化测试
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，以及登记图/名录/代次/并发次序/替换失败回滚/导出包封存放行领取/SQLite 持久化测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```

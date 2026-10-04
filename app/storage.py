@@ -7,7 +7,12 @@ Two pieces of state survive restarts:
   database, incremented once per successful whole-list replacement);
 * every registered graph: its original ``nodes``/``export`` submission and the
   review result produced under the registry generation the graph was last
-  reviewed at.
+  reviewed at;
+* every sealed export package: the sealed sample (``columns``/``rows``), the
+  registry generation it was created at and, once released, the generation it
+  was released at (null until then). Package rows and the release generation
+  are written inside the same explicit-transaction machinery, so a failed seal
+  leaves no package and a failed release leaves no release record.
 
 All reads and writes of the in-process state go through one lock, and a
 replacement persists the new entries, the new generation and every graph's new
@@ -48,6 +53,15 @@ CREATE TABLE IF NOT EXISTS graphs (
     export TEXT NOT NULL,
     review TEXT NOT NULL,
     review_generation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packages (
+    id TEXT PRIMARY KEY,
+    ordinal INTEGER NOT NULL,
+    graph_id TEXT NOT NULL,
+    columns TEXT NOT NULL,
+    sample_rows TEXT NOT NULL,
+    created_generation INTEGER NOT NULL,
+    released_generation INTEGER
 );
 """
 
@@ -206,6 +220,65 @@ class Store:
                     json.dumps(review, ensure_ascii=False),
                     generation,
                 ),
+            )
+
+    # ------------------------------------------------------------ packages --
+
+    def get_package_row(self, package_id: str) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, graph_id, columns, sample_rows, created_generation, "
+            "released_generation FROM packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+
+    def insert_package(
+        self,
+        package_id: str,
+        graph_id: str,
+        columns: list[str],
+        sample_rows: list[list[object]],
+        created_generation: int,
+    ) -> None:
+        """Seal a package: the sample and the creation generation commit once.
+
+        Everything is written inside one explicit transaction, so a failure
+        mid-write or at COMMIT rolls the insert back and no package id is ever
+        observable.
+        """
+        next_ordinal = self._conn.execute(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM packages"
+        ).fetchone()[0]
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO packages "
+                "(id, ordinal, graph_id, columns, sample_rows, "
+                "created_generation, released_generation) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    package_id,
+                    next_ordinal,
+                    graph_id,
+                    json.dumps(columns, ensure_ascii=False),
+                    json.dumps(sample_rows, ensure_ascii=False),
+                    created_generation,
+                ),
+            )
+
+    def release_package(
+        self, package_id: str, released_generation: int
+    ) -> None:
+        """Persist (or move) a package's release generation in one transaction.
+
+        The package row always exists by the time this runs (unknown ids are
+        rejected before the write), so a plain UPDATE covers both the first
+        release (NULL -> generation) and a later re-release at a newer
+        generation; any write or commit failure rolls back, leaving the
+        previous release state — or no release at all — exactly as it was.
+        """
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE packages SET released_generation = ? WHERE id = ?",
+                (released_generation, package_id),
             )
 
 

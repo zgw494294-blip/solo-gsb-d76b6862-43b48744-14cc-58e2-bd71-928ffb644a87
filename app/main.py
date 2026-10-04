@@ -21,6 +21,7 @@ from .models import (
     ComposeRequest,
     GraphPreviewRequest,
     GraphRegisterRequest,
+    PackageReleaseRequest,
     PreviewRequest,
     PruneRequest,
     RenameRequest,
@@ -56,9 +57,13 @@ app = FastAPI(
         "to report the export risks the candidate newly introduces. "
         "Graphs can additionally be registered by id and reviewed/previewed "
         "against a shared, versioned sensitive-column registry that is ORed "
-        "with every graph's in-graph sensitive marks."
+        "with every graph's in-graph sensitive marks. A passing registered "
+        "preview can be sealed into a pending-release export package; the "
+        "package is released against an expected registry generation and its "
+        "sealed sample can later be claimed without recomputation, with any "
+        "registry change after release invalidating the claim."
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -156,6 +161,82 @@ async def preview_registered_graph(graph_id: str, request: GraphPreviewRequest) 
             status_code=404,
             content={"error": {"code": "GRAPH_NOT_FOUND",
                                "message": f"no registered graph with id '{graph_id}'"}},
+        )
+
+
+@app.post("/api/graphs/{graph_id}/packages", status_code=201)
+async def seal_export_package(graph_id: str, request: GraphPreviewRequest) -> object:
+    # Same body as a registered preview (rows/conditions only) and the same
+    # current registry and original preview rules; a blocked graph or a bad
+    # input rejects the request and creates no package.
+    try:
+        return registry.seal_package(graph_id, request.rows, request.conditions)
+    except registry.GraphNotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "GRAPH_NOT_FOUND",
+                               "message": f"no registered graph with id '{graph_id}'"}},
+        )
+
+
+@app.post("/api/packages/{package_id}/release")
+async def release_export_package(
+    package_id: str, request: PackageReleaseRequest
+) -> object:
+    try:
+        return registry.release_package(package_id, request.expected_generation)
+    except registry.PackageNotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "PACKAGE_NOT_FOUND",
+                               "message": f"no sealed package with id '{package_id}'"}},
+        )
+    except registry.PackageStaleGeneration as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "PACKAGE_GENERATION_CONFLICT",
+                    "message": str(exc),
+                    "expected_generation": exc.expected,
+                    "current_generation": exc.current,
+                }
+            },
+        )
+
+
+@app.get("/api/packages/{package_id}")
+async def claim_export_package(package_id: str) -> object:
+    try:
+        return registry.claim_package(package_id)
+    except registry.PackageNotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "PACKAGE_NOT_FOUND",
+                               "message": f"no sealed package with id '{package_id}'"}},
+        )
+    except registry.PackageNotReleased as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "PACKAGE_NOT_RELEASED",
+                    "message": str(exc),
+                    "current_generation": exc.current_generation,
+                }
+            },
+        )
+    except registry.PackageStaleGeneration as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "PACKAGE_GENERATION_CONFLICT",
+                    "message": str(exc),
+                    "expected_generation": exc.expected,
+                    "current_generation": exc.current,
+                }
+            },
         )
 
 
